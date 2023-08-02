@@ -1,0 +1,20 @@
+[package]
+edition = "2021"
+name = "nrf-dfu"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+description = "Implementation of the Nordic nRF DFU protocol"
+readme = "README.md"
+categories = [
+  "embedded",
+  "no-std"
+]
+
+[dependencies]
+embedded-storage = "0.3.0"
+defmt = { version = "0.3", optional = true }
+
+[features]
+defmt = [
+      "dep:defmt",
+]
