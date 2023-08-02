@@ -1,9 +1,9 @@
 [package]
 edition = "2021"
-name = "nrf-dfu"
+name = "nrf-dfu-target"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-description = "Implementation of the Nordic nRF DFU protocol"
+description = "Implementation of the Nordic nRF DFU protocol for devices"
 repository = "https://github.com/lulf/nrf-dfu"
 readme = "README.md"
 categories = [
