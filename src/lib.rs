@@ -7,6 +7,7 @@ mod fmt;
 mod crc;
 mod dfu;
 
+#[doc(hidden)]
 pub mod prelude {
     pub use crate::dfu::*;
 }

@@ -6,14 +6,11 @@ const DFU_PROTOCOL_VERSION: u8 = 0x01;
 const OBJ_TYPE_COMMAND_IDX: usize = 0;
 const OBJ_TYPE_DATA_IDX: usize = 1;
 
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Command {
-    Swap { crc: u32, size: u32 },
-}
-
-/// Represents the target of a firmware update. Dispatches commands and data to
-/// a channel and data pipe which can be consumed by a separate async task.
+/// Represents the target of a firmware update.
+///
+/// Implements the DFU protocol by processing requests handed to it
+/// from the transport, writing to the underlying storage and returning
+/// the appropriate responses according to the protocol.
 pub struct DfuTarget<const MTU: usize> {
     crc_receipt_interval: u16,
     receipt_count: u16,
@@ -27,11 +24,14 @@ pub struct DfuTarget<const MTU: usize> {
     boffset: usize,
 }
 
+/// Status of the DFU process.
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DfuStatus {
+    /// DFU process is still ongoing.
     InProgress,
-    Done,
+    /// DFU process is done, should reset.
+    DoneReset,
 }
 
 /// Object representing a firmware blob. Tracks information about the firmware to be updated such as the CRC.
@@ -44,40 +44,62 @@ pub struct Object {
 
 /// Information about the firmware.
 pub struct FirmwareInfo {
+    /// Firmware type.
     pub ftype: FirmwareType,
+    /// Firmware version.
     pub version: u32,
+    /// Firmware flash address.
     pub addr: u32,
+    /// Firmware size,
     pub len: u32,
 }
 
 /// Information about the hardware.
 pub struct HardwareInfo {
+    /// Part number.
     pub part: u32,
+    /// Chip variant.
     pub variant: u32,
+    /// Size of flash.
     pub rom_size: u32,
+    /// Size of RAM.
     pub ram_size: u32,
+    /// Flash page size,
     pub rom_page_size: u32,
 }
 
 /// Represents a DFU request according to the nRF DFU protocol from SDK 17.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[allow(missing_docs)]
 pub enum DfuRequest<'m> {
+    /// Report protocol version.
     ProtocolVersion,
+    /// Create a new firmware object.
     Create { obj_type: ObjectType, obj_size: u32 },
+    /// Set receipt notification interval.
     SetReceiptNotification { target: u16 },
+    /// Request CRC of currently selected object.
     Crc,
+    /// Validate and enable new firmware.
     Execute,
+    /// Select object type as current.
     Select { obj_type: ObjectType },
+    /// Request MTU.
     MtuGet,
+    /// Write firmware data.
     Write { data: &'m [u8] },
+    /// Health check.
     Ping { id: u8 },
+    /// Request hardware version.
     HwVersion,
+    /// Request firmware version.
     FwVersion { image_id: u8 },
+    /// Abort firmware update process.
     Abort,
 }
 
-/// Represents a DFU resopnse according to the nRF DFU protocol from SDK 17.
+/// Represents a DFU response according to the nRF DFU protocol from SDK 17.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuResponse<'m> {
@@ -86,9 +108,10 @@ pub struct DfuResponse<'m> {
     body: Option<DfuResponseBody>,
 }
 
-/// Possible result values for a response.
+/// Possible result values for a response as defined by the protocol.
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[allow(missing_docs)]
 pub enum DfuResult {
     Invalid,
     Success,
@@ -102,31 +125,28 @@ pub enum DfuResult {
     ExtError(u8),
 }
 
-/// Possible payloads for a response.
+/// Response bodies for requests that have responses.
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[allow(missing_docs)]
 pub enum DfuResponseBody {
-    ProtocolVersion {
-        version: u8,
-    },
-    Crc {
-        offset: u32,
-        crc: u32,
-    },
+    /// Protocol version number.
+    ProtocolVersion { version: u8 },
+    /// CRC of current object.
+    Crc { offset: u32, crc: u32 },
+    /// Info about selected object.
     Select {
         offset: u32,
         crc: u32,
         max_size: u32,
     },
-    Mtu {
-        mtu: u16,
-    },
-    Write {
-        crc: u32,
-    },
-    Ping {
-        id: u8,
-    },
+    /// Requested MTU.
+    Mtu { mtu: u16 },
+    /// CRC of firmware written so far.
+    Write { crc: u32 },
+    /// Ping response.
+    Ping { id: u8 },
+    /// Hardware version.
     HwVersion {
         part: u32,
         variant: u32,
@@ -134,6 +154,7 @@ pub enum DfuResponseBody {
         ram_size: u32,
         rom_page_size: u32,
     },
+    /// Firmware version.
     FwVersion {
         ftype: FirmwareType,
         version: u32,
@@ -145,6 +166,7 @@ pub enum DfuResponseBody {
 /// Object types supported by the protocol.
 #[derive(Debug, Copy, Clone, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[allow(missing_docs)]
 pub enum ObjectType {
     Invalid = 0,
     Command = 1,
@@ -154,6 +176,7 @@ pub enum ObjectType {
 /// Firmware types supported by the protocol.
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[allow(missing_docs)]
 pub enum FirmwareType {
     Softdevice,
     Application,
@@ -162,11 +185,14 @@ pub enum FirmwareType {
 }
 
 #[repr(align(32))]
-pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
+struct AlignedBuffer<const N: usize>(pub [u8; N]);
 
+/// Errors returned by the DFU target.
 #[derive(Debug)]
 pub enum Error {
+    /// Errors from the underlying flash.
     Flash(NorFlashErrorKind),
+    /// Unexpected MTU from controller.
     Mtu,
 }
 
@@ -177,6 +203,7 @@ impl From<NorFlashErrorKind> for Error {
 }
 
 impl<const MTU: usize> DfuTarget<MTU> {
+    /// Create a new instance of a DFU target.
     pub fn new(flash_size: u32, fw_info: FirmwareInfo, hw_info: HardwareInfo) -> Self {
         Self {
             crc_receipt_interval: 0,
@@ -206,6 +233,14 @@ impl<const MTU: usize> DfuTarget<MTU> {
         }
     }
 
+    /// Process the DFU request as specified by the protocol.
+    ///
+    /// Any firmware writes will be written to the provided flash
+    /// region at the offsets requested by the DFU controller.
+    ///
+    /// The returned response should be sent back to the controller,
+    /// and the status should be examined to see if the device should
+    /// swap to the new firmware.
     pub fn process<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
@@ -217,16 +252,18 @@ impl<const MTU: usize> DfuTarget<MTU> {
         (response, status)
     }
 
-    pub fn process_inner<'m, DFU: NorFlash>(
+    fn process_inner<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
         dfu: &mut DFU,
     ) -> (DfuResponse<'m>, DfuStatus) {
         match request {
             DfuRequest::ProtocolVersion => (
-                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::ProtocolVersion {
-                    version: DFU_PROTOCOL_VERSION,
-                }),
+                DfuResponse::new(request, DfuResult::Success).body(
+                    DfuResponseBody::ProtocolVersion {
+                        version: DFU_PROTOCOL_VERSION,
+                    },
+                ),
                 DfuStatus::InProgress,
             ),
             DfuRequest::Create { obj_type, obj_size } => {
@@ -261,11 +298,17 @@ impl<const MTU: usize> DfuTarget<MTU> {
                     }
                 }
                 self.receipt_count = 0;
-                (DfuResponse::new(request, DfuResult::Success), DfuStatus::InProgress)
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
             }
             DfuRequest::SetReceiptNotification { target } => {
                 self.crc_receipt_interval = target;
-                (DfuResponse::new(request, DfuResult::Success), DfuStatus::InProgress)
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
             }
             DfuRequest::Crc => (
                 DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::Crc {
@@ -290,7 +333,10 @@ impl<const MTU: usize> DfuTarget<MTU> {
                                 #[cfg(feature = "defmt")]
                                 let e = defmt::Debug2Format(&e);
                                 warn!("Write Error: {:?}", e);
-                                return (DfuResponse::new(request, DfuResult::OpFailed), DfuStatus::InProgress);
+                                return (
+                                    DfuResponse::new(request, DfuResult::OpFailed),
+                                    DfuStatus::InProgress,
+                                );
                             }
                             self.offset += self.boffset;
                             self.boffset = 0;
@@ -318,13 +364,22 @@ impl<const MTU: usize> DfuTarget<MTU> {
 
                         if obj.crc.finish() == check.finish() {
                             info!("Firmware CRC check success");
-                            (DfuResponse::new(request, DfuResult::Success), DfuStatus::Done)
+                            (
+                                DfuResponse::new(request, DfuResult::Success),
+                                DfuStatus::DoneReset,
+                            )
                         } else {
                             warn!("Firmware CRC check error");
-                            (DfuResponse::new(request, DfuResult::OpFailed), DfuStatus::InProgress)
+                            (
+                                DfuResponse::new(request, DfuResult::OpFailed),
+                                DfuStatus::InProgress,
+                            )
                         }
                     } else {
-                        (DfuResponse::new(request, DfuResult::Success), DfuStatus::InProgress)
+                        (
+                            DfuResponse::new(request, DfuResult::Success),
+                            DfuStatus::InProgress,
+                        )
                     }
                 }
             }
@@ -336,11 +391,13 @@ impl<const MTU: usize> DfuTarget<MTU> {
                 };
                 if let Some(idx) = idx {
                     (
-                        DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::Select {
-                            offset: self.objects[idx].offset,
-                            crc: self.objects[idx].crc.finish(),
-                            max_size: self.objects[idx].size,
-                        }),
+                        DfuResponse::new(request, DfuResult::Success).body(
+                            DfuResponseBody::Select {
+                                offset: self.objects[idx].offset,
+                                crc: self.objects[idx].crc.finish(),
+                                max_size: self.objects[idx].size,
+                            },
+                        ),
                         DfuStatus::InProgress,
                     )
                 } else {
@@ -352,7 +409,8 @@ impl<const MTU: usize> DfuTarget<MTU> {
             }
 
             DfuRequest::MtuGet => (
-                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::Mtu { mtu: MTU as u16 }),
+                DfuResponse::new(request, DfuResult::Success)
+                    .body(DfuResponseBody::Mtu { mtu: MTU as u16 }),
                 DfuStatus::InProgress,
             ),
             DfuRequest::Write { data } => {
@@ -360,16 +418,21 @@ impl<const MTU: usize> DfuTarget<MTU> {
                 if let ObjectType::Data = obj.obj_type {
                     let mut pos = 0;
                     while pos < data.len() {
-                        let to_copy = core::cmp::min(data.len() - pos, self.buffer.0.len() - self.boffset);
+                        let to_copy =
+                            core::cmp::min(data.len() - pos, self.buffer.0.len() - self.boffset);
                         //info!("Copying {} bytes to internal buffer", to_copy);
-                        self.buffer.0[self.boffset..self.boffset + to_copy].copy_from_slice(&data[pos..pos + to_copy]);
+                        self.buffer.0[self.boffset..self.boffset + to_copy]
+                            .copy_from_slice(&data[pos..pos + to_copy]);
 
                         if self.boffset == self.buffer.0.len() {
                             if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0) {
                                 #[cfg(feature = "defmt")]
                                 let e = defmt::Debug2Format(&e);
                                 warn!("Write Error: {:?}", e);
-                                return (DfuResponse::new(request, DfuResult::OpFailed), DfuStatus::InProgress);
+                                return (
+                                    DfuResponse::new(request, DfuResult::OpFailed),
+                                    DfuStatus::InProgress,
+                                );
                             }
 
                             self.offset += self.boffset;
@@ -433,7 +496,10 @@ impl<const MTU: usize> DfuTarget<MTU> {
                 self.receipt_count = 0;
                 self.boffset = 0;
                 self.offset = 0;
-                (DfuResponse::new(request, DfuResult::Success), DfuStatus::InProgress)
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
             }
         }
     }
@@ -460,6 +526,7 @@ impl<'m> DfuRequest<'m> {
         }
     }
 
+    /// Decode the request from the data and return excess data not parsed.
     pub fn decode(data: &'m [u8]) -> Result<(DfuRequest<'m>, &'m [u8]), ()> {
         let mut data = ReadBuf::new(data);
         let op = data.decode_u8()?;
@@ -501,6 +568,7 @@ impl<'m> DfuRequest<'m> {
 }
 
 impl<'m> DfuResponse<'m> {
+    /// Create a response for a given request with the reported result.
     pub fn new(request: DfuRequest<'m>, result: DfuResult) -> DfuResponse<'m> {
         DfuResponse {
             request,
@@ -509,6 +577,7 @@ impl<'m> DfuResponse<'m> {
         }
     }
 
+    /// Set a response body.
     pub fn body(self, body: DfuResponseBody) -> Self {
         Self {
             request: self.request,
@@ -516,6 +585,8 @@ impl<'m> DfuResponse<'m> {
             body: Some(body),
         }
     }
+
+    /// Encode the response into the provided buffer.
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, ()> {
         let mut buf = WriteBuf::new(buf);
         const DFU_RESPONSE_OP_CODE: u8 = 0x60;
@@ -567,7 +638,11 @@ impl DfuResponseBody {
                 buf.encode_u32(*offset)?;
                 buf.encode_u32(*crc)?;
             }
-            DfuResponseBody::Select { offset, crc, max_size } => {
+            DfuResponseBody::Select {
+                offset,
+                crc,
+                max_size,
+            } => {
                 buf.encode_u32(*max_size)?;
                 buf.encode_u32(*offset)?;
                 buf.encode_u32(*crc)?;
@@ -824,10 +899,13 @@ mod tests {
 
         let response = target.process(DfuRequest::Execute, &mut test_flash);
         assert_eq!(DfuResult::Success, response.0.result);
-        assert_eq!(DfuStatus::Done, response.1);
+        assert_eq!(DfuStatus::DoneReset, response.1);
         assert_eq!(&test_flash.mem[0..12345], firmware);
     }
 
+    ///
+    /// In-memory flash implementation taken from embassy-boot
+    ///
     use alloc::vec::Vec;
 
     use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
@@ -840,7 +918,9 @@ mod tests {
         pub erases: Vec<(u32, u32)>,
     }
 
-    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> MemFlash<SIZE, ERASE_SIZE, WRITE_SIZE> {
+    impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize>
+        MemFlash<SIZE, ERASE_SIZE, WRITE_SIZE>
+    {
         #[allow(unused)]
         pub const fn new(fill: u8) -> Self {
             Self {
