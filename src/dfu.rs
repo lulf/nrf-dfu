@@ -1,4 +1,8 @@
+
+#[cfg(not(feature = "async"))]
 use embedded_storage::nor_flash::{NorFlash, NorFlashErrorKind};
+#[cfg(feature = "async")]
+use embedded_storage_async::nor_flash::{NorFlash, NorFlashErrorKind};
 
 use crate::crc::*;
 
@@ -241,6 +245,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
     /// The returned response should be sent back to the controller,
     /// and the status should be examined to see if the device should
     /// swap to the new firmware.
+    #[cfg(not(feature = "async"))]
     pub fn process<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
@@ -251,7 +256,20 @@ impl<const MTU: usize> DfuTarget<MTU> {
         trace!("DFU RESPONSE {:?}", response);
         (response, status)
     }
+    
+    #[cfg(feature = "async")]
+    pub async fn process<'m, DFU: NorFlash>(
+        &mut self,
+        request: DfuRequest<'m>,
+        dfu: &mut DFU,
+    ) -> (DfuResponse<'m>, DfuStatus) {
+        trace!("DFU REQUEST {:?}", request);
+        let (response, status) = self.process_inner(request, dfu).await;
+        trace!("DFU RESPONSE {:?}", response);
+        (response, status)
+    }
 
+    #[cfg(not(feature = "async"))]
     fn process_inner<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
@@ -426,6 +444,259 @@ impl<const MTU: usize> DfuTarget<MTU> {
 
                         if self.boffset == self.buffer.0.len() {
                             if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0) {
+                                #[cfg(feature = "defmt")]
+                                let e = defmt::Debug2Format(&e);
+                                warn!("Write Error: {:?}", e);
+                                return (
+                                    DfuResponse::new(request, DfuResult::OpFailed),
+                                    DfuStatus::InProgress,
+                                );
+                            }
+
+                            self.offset += self.boffset;
+                            self.boffset = 0;
+                        } else {
+                            self.boffset += to_copy;
+                        }
+                        pos += to_copy;
+                        // info!("Wrote {} bytes to flash (total {})", to_copy, self.offset);
+                    }
+                }
+                obj.crc.add(data);
+                obj.offset += data.len() as u32;
+
+                let mut response = DfuResponse::new(request, DfuResult::Success);
+                if self.crc_receipt_interval > 0 {
+                    self.receipt_count += 1;
+                    if self.receipt_count == self.crc_receipt_interval {
+                        self.receipt_count = 0;
+                        response = response.body(DfuResponseBody::Crc {
+                            offset: obj.offset,
+                            crc: obj.crc.finish(),
+                        });
+                    }
+                } else {
+                    response = response.body(DfuResponseBody::Crc {
+                        offset: obj.offset,
+                        crc: obj.crc.finish(),
+                    });
+                };
+                (response, DfuStatus::InProgress)
+            }
+            DfuRequest::Ping { id } => (
+                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::Ping { id }),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::HwVersion => (
+                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::HwVersion {
+                    part: self.hw_info.part,
+                    variant: self.hw_info.variant,
+                    rom_size: self.hw_info.rom_size,
+                    ram_size: self.hw_info.ram_size,
+                    rom_page_size: self.hw_info.rom_page_size,
+                }),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::FwVersion { image_id: _ } => (
+                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::FwVersion {
+                    ftype: self.fw_info.ftype,
+                    version: self.fw_info.version,
+                    addr: self.fw_info.addr,
+                    len: self.fw_info.len,
+                }),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::Abort => {
+                self.objects[0].crc.reset();
+                self.objects[0].offset = 0;
+                self.objects[1].crc.reset();
+                self.objects[1].offset = 0;
+                self.receipt_count = 0;
+                self.boffset = 0;
+                self.offset = 0;
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    async fn process_inner<'m, DFU: NorFlash>(
+        &mut self,
+        request: DfuRequest<'m>,
+        dfu: &mut DFU,
+    ) -> (DfuResponse<'m>, DfuStatus) {
+        match request {
+            DfuRequest::ProtocolVersion => (
+                DfuResponse::new(request, DfuResult::Success).body(
+                    DfuResponseBody::ProtocolVersion {
+                        version: DFU_PROTOCOL_VERSION,
+                    },
+                ),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::Create { obj_type, obj_size } => {
+                let idx = match obj_type {
+                    ObjectType::Command => Some(OBJ_TYPE_COMMAND_IDX),
+                    ObjectType::Data => Some(OBJ_TYPE_DATA_IDX),
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    self.objects[idx] = Object {
+                        obj_type,
+                        size: obj_size,
+                        offset: 0,
+                        crc: Crc32::init(),
+                    };
+                    self.current = idx;
+                    if let ObjectType::Data = obj_type {
+                        let size = self.objects[self.current].size;
+                        let to = size + (DFU::ERASE_SIZE as u32 - size % DFU::ERASE_SIZE as u32);
+                        match dfu.erase(0, to as u32).await {
+                            Ok(_) => {
+                                self.objects[self.current].offset = 0;
+                                self.boffset = 0;
+                                self.offset = 0;
+                            }
+                            Err(e) => {
+                                #[cfg(feature = "defmt")]
+                                let e = defmt::Debug2Format(&e);
+                                warn!("Error during erase: {:?}", e);
+                            }
+                        }
+                    }
+                }
+                self.receipt_count = 0;
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
+            }
+            DfuRequest::SetReceiptNotification { target } => {
+                self.crc_receipt_interval = target;
+                (
+                    DfuResponse::new(request, DfuResult::Success),
+                    DfuStatus::InProgress,
+                )
+            }
+            DfuRequest::Crc => (
+                DfuResponse::new(request, DfuResult::Success).body(DfuResponseBody::Crc {
+                    offset: self.objects[self.current].offset,
+                    crc: self.objects[self.current].crc.finish(),
+                }),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::Execute => {
+                let obj = &mut self.objects[self.current];
+                if obj.offset != obj.size {
+                    (
+                        DfuResponse::new(request, DfuResult::OpNotSupported),
+                        DfuStatus::InProgress,
+                    )
+                } else {
+                    if let ObjectType::Data = obj.obj_type {
+                        // Flush remaining data
+                        if self.boffset > 0 {
+                            // Write at previous boundary which was left in memory.
+                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0).await {
+                                #[cfg(feature = "defmt")]
+                                let e = defmt::Debug2Format(&e);
+                                warn!("Write Error: {:?}", e);
+                                return (
+                                    DfuResponse::new(request, DfuResult::OpFailed),
+                                    DfuStatus::InProgress,
+                                );
+                            }
+                            self.offset += self.boffset;
+                            self.boffset = 0;
+                        }
+                        info!("Verifying firmware integrity");
+                        let mut check = Crc32::init();
+                        let mut buf = [0; MTU];
+                        let mut offset: u32 = 0;
+                        let size = obj.size;
+                        while offset < size {
+                            let to_read = core::cmp::min(buf.len(), (size - offset) as usize);
+                            match dfu.read(offset, &mut buf[..to_read]).await {
+                                Ok(_) => {
+                                    check.add(&buf[..to_read]);
+                                    offset += to_read as u32;
+                                }
+                                Err(e) => {
+                                    #[cfg(feature = "defmt")]
+                                    let e = defmt::Debug2Format(&e);
+                                    warn!("Error verifying firmware integrity: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if obj.crc.finish() == check.finish() {
+                            info!("Firmware CRC check success");
+                            (
+                                DfuResponse::new(request, DfuResult::Success),
+                                DfuStatus::DoneReset,
+                            )
+                        } else {
+                            warn!("Firmware CRC check error");
+                            (
+                                DfuResponse::new(request, DfuResult::OpFailed),
+                                DfuStatus::InProgress,
+                            )
+                        }
+                    } else {
+                        (
+                            DfuResponse::new(request, DfuResult::Success),
+                            DfuStatus::InProgress,
+                        )
+                    }
+                }
+            }
+            DfuRequest::Select { obj_type } => {
+                let idx = match obj_type {
+                    ObjectType::Command => Some(OBJ_TYPE_COMMAND_IDX),
+                    ObjectType::Data => Some(OBJ_TYPE_DATA_IDX),
+                    _ => None,
+                };
+                if let Some(idx) = idx {
+                    (
+                        DfuResponse::new(request, DfuResult::Success).body(
+                            DfuResponseBody::Select {
+                                offset: self.objects[idx].offset,
+                                crc: self.objects[idx].crc.finish(),
+                                max_size: self.objects[idx].size,
+                            },
+                        ),
+                        DfuStatus::InProgress,
+                    )
+                } else {
+                    (
+                        DfuResponse::new(request, DfuResult::InvalidObject),
+                        DfuStatus::InProgress,
+                    )
+                }
+            }
+
+            DfuRequest::MtuGet => (
+                DfuResponse::new(request, DfuResult::Success)
+                    .body(DfuResponseBody::Mtu { mtu: MTU as u16 }),
+                DfuStatus::InProgress,
+            ),
+            DfuRequest::Write { data } => {
+                let obj = &mut self.objects[self.current];
+                if let ObjectType::Data = obj.obj_type {
+                    let mut pos = 0;
+                    while pos < data.len() {
+                        let to_copy =
+                            core::cmp::min(data.len() - pos, self.buffer.0.len() - self.boffset);
+                        //info!("Copying {} bytes to internal buffer", to_copy);
+                        self.buffer.0[self.boffset..self.boffset + to_copy]
+                            .copy_from_slice(&data[pos..pos + to_copy]);
+
+                        if self.boffset == self.buffer.0.len() {
+                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0).await {
                                 #[cfg(feature = "defmt")]
                                 let e = defmt::Debug2Format(&e);
                                 warn!("Write Error: {:?}", e);
