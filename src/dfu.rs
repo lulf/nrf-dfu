@@ -898,6 +898,228 @@ mod tests {
         assert_eq!(&test_flash.mem[0..12345], firmware);
     }
 
+    #[test]
+    fn test_full_firmware_update() {
+        let mut test_flash: MemFlash<65536, 4096, 1> = MemFlash::new(0);
+        let fake_data: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
+
+        let mut target: DfuTarget<4> = DfuTarget::new(
+            65536,
+            FirmwareInfo {
+                ftype: FirmwareType::Application,
+                version: 0,
+                addr: 0,
+                len: 0,
+            },
+            HardwareInfo {
+                part: 0,
+                variant: 0,
+                rom_size: 0,
+                ram_size: 0,
+                rom_page_size: 0,
+            },
+        );
+
+        /*
+        REQUEST Select { obj_type: Command }
+        RESPONSE DfuResponse { request: Select { obj_type: Command }, result: Success, body: Some(Select { offset: 0, crc: 0, max_size: 512 }) }
+        */
+        let response = target.process(
+            DfuRequest::Select {
+                obj_type: ObjectType::Command,
+            },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        let body = response.0.body.unwrap();
+        if let Some(DfuResponseBody::Select {
+            offset,
+            crc,
+            max_size,
+        }) = response.0.body
+        {
+            assert_eq!(0, crc);
+            assert_eq!(0, offset);
+            assert_eq!(target.objects[0].size, max_size);
+        } else {
+            panic!("Unexpected DFU response body: {:?}", body);
+        }
+
+        /*
+        REQUEST SetReceiptNotification { target: 0 }
+        RESPONSE DfuResponse { request: SetReceiptNotification { target: 0 }, result: Success, body: None }
+        */
+        let response = target.process(
+            DfuRequest::SetReceiptNotification { target: 0 },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        assert_eq!(target.offset, 0);
+
+        /*
+        // In the original trace, the obj_size was 79 bytes
+        REQUEST Create { obj_type: Command, obj_size: 8 }
+        RESPONSE DfuResponse { request: Create { obj_type: Command, obj_size: 8 }, result: Success, body: None }
+        */
+        let response = target.process(
+            DfuRequest::Create {
+                obj_type: ObjectType::Command,
+                obj_size: fake_data.len() as u32,
+            },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        /*
+        REQUEST Write { data: [..] }
+        RESPONSE DfuResponse { request: Crc, result: Success, body: None }
+        */
+        // TODO: It seems that header isn't really validated, as long as
+        // the response body is empty.
+        let response = target.process(DfuRequest::Write { data: &fake_data }, &mut test_flash);
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        // Validate whether DFU target object is there
+        assert_eq!(target.current, 0);
+        assert_eq!(target.objects[target.current].obj_type, ObjectType::Command);
+        assert_eq!(target.objects[target.current].size, fake_data.len() as u32);
+
+        /*
+        REQUEST Crc
+        RESPONSE DfuResponse { request: Crc, result: Success, body: Some(Crc { offset: 8, crc: }) }
+        */
+        let response = target.process(DfuRequest::Crc {}, &mut test_flash);
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
+            assert_eq!(target.objects[target.current].offset, offset);
+            assert_eq!(target.objects[target.current].size, offset);
+            assert_eq!(target.objects[target.current].crc.finish(), crc);
+        } else {
+            panic!("Unexpected DFU response body: {:?}", body);
+        };
+
+        /*
+        REQUEST Execute
+        RESPONSE DfuResponse { request: Execute, result: Success, body: None }
+        */
+        let response = target.process(DfuRequest::Execute {}, &mut test_flash);
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        // Control packet is now completed, switch to firmware transfer
+
+        /*
+        REQUEST SetReceiptNotification { target: 5 }
+        RESPONSE DfuResponse { request: SetReceiptNotification { target: 5 }, result: Success, body: None }
+        */
+        let response = target.process(
+            DfuRequest::SetReceiptNotification { target: 5 },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+        assert_eq!(target.crc_receipt_interval, 5);
+
+        /*
+        REQUEST Select { obj_type: Data }
+        RESPONSE DfuResponse { request: Select { obj_type: Data }, result: Success, body: Some(Select { offset: 0, crc: 0, max_size: 335872 }) }
+        */
+        let response = target.process(
+            DfuRequest::Select {
+                obj_type: ObjectType::Data,
+            },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        if let Some(DfuResponseBody::Select {
+            offset,
+            crc,
+            max_size,
+        }) = response.0.body
+        {
+            assert_eq!(0, crc);
+            assert_eq!(0, offset);
+            assert_eq!(target.objects[1].size, max_size);
+        } else {
+            panic!("Unexpected DFU response body: {:?}", body);
+        }
+
+        /*
+        REQUEST Create { obj_type: Data, obj_size: 12 }
+        RESPONSE DfuResponse { request: Create { obj_type: Data, obj_size: 12}, result: Success, body: None }
+        */
+        let response = target.process(
+            DfuRequest::Create {
+                obj_type: ObjectType::Data,
+                obj_size: 12,
+            },
+            &mut test_flash,
+        );
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        for i in 0..=3 {
+            let response = target.process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash);
+            assert_eq!(target.receipt_count, i + 1);
+            assert_eq!(response.0.body.is_none(), true);
+        }
+
+        // 5th write should trigger the CrC response with body
+        let response = target.process(DfuRequest::Write { data: &[0xbb; 2] }, &mut test_flash);
+        if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
+            assert_eq!(offset, 10);
+            assert_eq!(crc, 0xDB870467);
+        } else {
+            panic!("Unexpected DFU response body: {:?}", body);
+        };
+        assert_eq!(target.receipt_count, 0);
+
+        // Final write
+        let response = target.process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash);
+        assert_eq!(target.receipt_count, 1);
+        assert_eq!(response.0.body.is_none(), true);
+
+        /*
+        REQUEST Crc
+        RESPONSE DfuResponse { request: Crc, result: Success, body: Some(Crc { offset: 12, crc: }) }
+        */
+        let response = target.process(DfuRequest::Crc {}, &mut test_flash);
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::InProgress, response.1);
+        if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
+            assert_eq!(target.objects[target.current].offset, offset);
+            assert_eq!(target.objects[target.current].size, offset);
+            assert_eq!(target.objects[target.current].crc.finish(), crc);
+        } else {
+            panic!("Unexpected DFU response body: {:?}", body);
+        };
+
+        /*
+        REQUEST Execute
+        RESPONSE DfuResponse { request: Execute, result: Success, body: None }
+        */
+        let response = target.process(DfuRequest::Execute, &mut test_flash);
+        assert_eq!(DfuResult::Success, response.0.result);
+        assert_eq!(DfuStatus::DoneReset, response.1);
+        assert_eq!(
+            &test_flash.mem[0..target.objects[target.current].size as usize],
+            &[0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xaa, 0xaa]
+        );
+    }
+
     ///
     /// In-memory flash implementation taken from embassy-boot
     ///
