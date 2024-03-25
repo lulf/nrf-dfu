@@ -447,7 +447,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                 obj.crc.add(data);
                 obj.offset += data.len() as u32;
 
-                let mut response = DfuResponse::new(request, DfuResult::Success);
+                let mut response = DfuResponse::new(DfuRequest::Crc, DfuResult::Success);
                 if self.crc_receipt_interval > 0 {
                     self.receipt_count += 1;
                     if self.receipt_count == self.crc_receipt_interval {
@@ -457,12 +457,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                             crc: obj.crc.finish(),
                         });
                     }
-                } else {
-                    response = response.body(DfuResponseBody::Crc {
-                        offset: obj.offset,
-                        crc: obj.crc.finish(),
-                    });
-                };
+                }
                 (response, DfuStatus::InProgress)
             }
             DfuRequest::Ping { id } => (
