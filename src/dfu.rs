@@ -31,7 +31,10 @@ pub enum DfuStatus {
     /// DFU process is still ongoing.
     InProgress,
     /// DFU process is done, should reset.
-    DoneReset,
+    DoneReset {
+        /// Size of the written firmware
+        size: u32,
+    },
 }
 
 /// Object representing a firmware blob. Tracks information about the firmware to be updated such as the CRC.
@@ -366,7 +369,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                             info!("Firmware CRC check success");
                             (
                                 DfuResponse::new(request, DfuResult::Success),
-                                DfuStatus::DoneReset,
+                                DfuStatus::DoneReset { size },
                             )
                         } else {
                             warn!("Firmware CRC check error");
@@ -894,7 +897,12 @@ mod tests {
 
         let response = target.process(DfuRequest::Execute, &mut test_flash);
         assert_eq!(DfuResult::Success, response.0.result);
-        assert_eq!(DfuStatus::DoneReset, response.1);
+        assert_eq!(
+            DfuStatus::DoneReset {
+                size: firmware.len() as u32
+            },
+            response.1
+        );
         assert_eq!(&test_flash.mem[0..12345], firmware);
     }
 
@@ -1113,7 +1121,7 @@ mod tests {
         */
         let response = target.process(DfuRequest::Execute, &mut test_flash);
         assert_eq!(DfuResult::Success, response.0.result);
-        assert_eq!(DfuStatus::DoneReset, response.1);
+        assert_eq!(DfuStatus::DoneReset { size: 12 }, response.1);
         assert_eq!(
             &test_flash.mem[0..target.objects[target.current].size as usize],
             &[0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xaa, 0xaa]

@@ -12,7 +12,7 @@ categories = [
 ]
 
 [dependencies]
-embedded-storage = "0.3.0"
+embedded-storage = "0.3.1"
 defmt = { version = "0.3", optional = true }
 
 [features]
