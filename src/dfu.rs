@@ -1,4 +1,4 @@
-use embedded_storage::nor_flash::{NorFlash, NorFlashErrorKind};
+use embedded_storage_async::nor_flash::{NorFlash, NorFlashErrorKind};
 
 use crate::crc::*;
 
@@ -31,10 +31,7 @@ pub enum DfuStatus {
     /// DFU process is still ongoing.
     InProgress,
     /// DFU process is done, should reset.
-    DoneReset {
-        /// Size of the written firmware
-        size: u32,
-    },
+    DoneReset,
 }
 
 /// Object representing a firmware blob. Tracks information about the firmware to be updated such as the CRC.
@@ -244,18 +241,18 @@ impl<const MTU: usize> DfuTarget<MTU> {
     /// The returned response should be sent back to the controller,
     /// and the status should be examined to see if the device should
     /// swap to the new firmware.
-    pub fn process<'m, DFU: NorFlash>(
+    pub async fn process<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
         dfu: &mut DFU,
     ) -> (DfuResponse<'m>, DfuStatus) {
         trace!("DFU REQUEST {:?}", request);
-        let (response, status) = self.process_inner(request, dfu);
+        let (response, status) = self.process_inner(request, dfu).await;
         trace!("DFU RESPONSE {:?}", response);
         (response, status)
     }
 
-    fn process_inner<'m, DFU: NorFlash>(
+    async fn process_inner<'m, DFU: NorFlash>(
         &mut self,
         request: DfuRequest<'m>,
         dfu: &mut DFU,
@@ -286,7 +283,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                     if let ObjectType::Data = obj_type {
                         let size = self.objects[self.current].size;
                         let to = size + (DFU::ERASE_SIZE as u32 - size % DFU::ERASE_SIZE as u32);
-                        match dfu.erase(0, to as u32) {
+                        match dfu.erase(0, to as u32).await {
                             Ok(_) => {
                                 self.objects[self.current].offset = 0;
                                 self.boffset = 0;
@@ -332,7 +329,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                         // Flush remaining data
                         if self.boffset > 0 {
                             // Write at previous boundary which was left in memory.
-                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0) {
+                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0).await {
                                 #[cfg(feature = "defmt")]
                                 let e = defmt::Debug2Format(&e);
                                 warn!("Write Error: {:?}", e);
@@ -351,7 +348,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                         let size = obj.size;
                         while offset < size {
                             let to_read = core::cmp::min(buf.len(), (size - offset) as usize);
-                            match dfu.read(offset, &mut buf[..to_read]) {
+                            match dfu.read(offset, &mut buf[..to_read]).await {
                                 Ok(_) => {
                                     check.add(&buf[..to_read]);
                                     offset += to_read as u32;
@@ -367,9 +364,30 @@ impl<const MTU: usize> DfuTarget<MTU> {
 
                         if obj.crc.finish() == check.finish() {
                             info!("Firmware CRC check success");
+
+                            // Fill the rest with some magic
+                            if size < dfu.capacity() as u32 {
+                                let magic = AlignedBuffer([
+                                    0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50,
+                                    0x52, 0x35, 0x80, 0x79, 0xb6, 0x2c,
+                                ]);
+                                for offset in (size..dfu.capacity() as u32).step_by(magic.0.len()) {
+                                    let to_write =
+                                        (magic.0.len()).min(dfu.capacity() - offset as usize);
+                                    if let Err(e) = dfu.write(offset, &magic.0[..to_write]).await {
+                                        #[cfg(feature = "defmt")]
+                                        let e = defmt::Debug2Format(&e);
+                                        warn!("Write Error: {:?}", e);
+                                        return (
+                                            DfuResponse::new(request, DfuResult::OpFailed),
+                                            DfuStatus::InProgress,
+                                        );
+                                    }
+                                }
+                            }
                             (
                                 DfuResponse::new(request, DfuResult::Success),
-                                DfuStatus::DoneReset { size },
+                                DfuStatus::DoneReset,
                             )
                         } else {
                             warn!("Firmware CRC check error");
@@ -428,7 +446,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                             .copy_from_slice(&data[pos..pos + to_copy]);
 
                         if self.boffset == self.buffer.0.len() {
-                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0) {
+                            if let Err(e) = dfu.write(self.offset as u32, &self.buffer.0).await {
                                 #[cfg(feature = "defmt")]
                                 let e = defmt::Debug2Format(&e);
                                 warn!("Write Error: {:?}", e);
@@ -840,8 +858,8 @@ impl<'m> WriteBuf<'m> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_update_protocol() {
+    #[futures_test::test]
+    async fn test_update_protocol() {
         let mut test_flash: MemFlash<65536, 4096, 1> = MemFlash::new(0);
         let firmware = [13; 12345];
         let mut crc = Crc32::init();
@@ -865,25 +883,29 @@ mod tests {
             },
         );
 
-        let response = target.process(
-            DfuRequest::Create {
-                obj_type: ObjectType::Data,
-                obj_size: firmware.len() as u32,
-            },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::Create {
+                    obj_type: ObjectType::Data,
+                    obj_size: firmware.len() as u32,
+                },
+                &mut test_flash,
+            )
+            .await;
 
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(&[0xff; 12345], &test_flash.mem[0..12345]);
 
         for chunk in firmware.chunks(120) {
-            let response = target.process(DfuRequest::Write { data: chunk }, &mut test_flash);
+            let response = target
+                .process(DfuRequest::Write { data: chunk }, &mut test_flash)
+                .await;
             assert_eq!(DfuResult::Success, response.0.result);
             assert_eq!(DfuStatus::InProgress, response.1);
         }
 
-        let response = target.process(DfuRequest::Crc, &mut test_flash);
+        let response = target.process(DfuRequest::Crc, &mut test_flash).await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         let body = response.0.body.unwrap();
@@ -895,19 +917,14 @@ mod tests {
             panic!("Unexpected DFU response body: {:?}", body);
         }
 
-        let response = target.process(DfuRequest::Execute, &mut test_flash);
+        let response = target.process(DfuRequest::Execute, &mut test_flash).await;
         assert_eq!(DfuResult::Success, response.0.result);
-        assert_eq!(
-            DfuStatus::DoneReset {
-                size: firmware.len() as u32
-            },
-            response.1
-        );
+        assert_eq!(DfuStatus::DoneReset, response.1);
         assert_eq!(&test_flash.mem[0..12345], firmware);
     }
 
-    #[test]
-    fn test_full_firmware_update() {
+    #[futures_test::test]
+    async fn test_full_firmware_update() {
         let mut test_flash: MemFlash<65536, 4096, 1> = MemFlash::new(0);
         let fake_data: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11];
 
@@ -932,12 +949,14 @@ mod tests {
         REQUEST Select { obj_type: Command }
         RESPONSE DfuResponse { request: Select { obj_type: Command }, result: Success, body: Some(Select { offset: 0, crc: 0, max_size: 512 }) }
         */
-        let response = target.process(
-            DfuRequest::Select {
-                obj_type: ObjectType::Command,
-            },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::Select {
+                    obj_type: ObjectType::Command,
+                },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         let body = response.0.body.unwrap();
@@ -958,10 +977,12 @@ mod tests {
         REQUEST SetReceiptNotification { target: 0 }
         RESPONSE DfuResponse { request: SetReceiptNotification { target: 0 }, result: Success, body: None }
         */
-        let response = target.process(
-            DfuRequest::SetReceiptNotification { target: 0 },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::SetReceiptNotification { target: 0 },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
@@ -973,13 +994,15 @@ mod tests {
         REQUEST Create { obj_type: Command, obj_size: 8 }
         RESPONSE DfuResponse { request: Create { obj_type: Command, obj_size: 8 }, result: Success, body: None }
         */
-        let response = target.process(
-            DfuRequest::Create {
-                obj_type: ObjectType::Command,
-                obj_size: fake_data.len() as u32,
-            },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::Create {
+                    obj_type: ObjectType::Command,
+                    obj_size: fake_data.len() as u32,
+                },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
@@ -990,7 +1013,9 @@ mod tests {
         */
         // TODO: It seems that header isn't really validated, as long as
         // the response body is empty.
-        let response = target.process(DfuRequest::Write { data: &fake_data }, &mut test_flash);
+        let response = target
+            .process(DfuRequest::Write { data: &fake_data }, &mut test_flash)
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
@@ -1004,7 +1029,7 @@ mod tests {
         REQUEST Crc
         RESPONSE DfuResponse { request: Crc, result: Success, body: Some(Crc { offset: 8, crc: }) }
         */
-        let response = target.process(DfuRequest::Crc {}, &mut test_flash);
+        let response = target.process(DfuRequest::Crc {}, &mut test_flash).await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
@@ -1019,7 +1044,9 @@ mod tests {
         REQUEST Execute
         RESPONSE DfuResponse { request: Execute, result: Success, body: None }
         */
-        let response = target.process(DfuRequest::Execute {}, &mut test_flash);
+        let response = target
+            .process(DfuRequest::Execute {}, &mut test_flash)
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
@@ -1030,10 +1057,12 @@ mod tests {
         REQUEST SetReceiptNotification { target: 5 }
         RESPONSE DfuResponse { request: SetReceiptNotification { target: 5 }, result: Success, body: None }
         */
-        let response = target.process(
-            DfuRequest::SetReceiptNotification { target: 5 },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::SetReceiptNotification { target: 5 },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
@@ -1043,12 +1072,14 @@ mod tests {
         REQUEST Select { obj_type: Data }
         RESPONSE DfuResponse { request: Select { obj_type: Data }, result: Success, body: Some(Select { offset: 0, crc: 0, max_size: 335872 }) }
         */
-        let response = target.process(
-            DfuRequest::Select {
-                obj_type: ObjectType::Data,
-            },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::Select {
+                    obj_type: ObjectType::Data,
+                },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         if let Some(DfuResponseBody::Select {
@@ -1068,25 +1099,31 @@ mod tests {
         REQUEST Create { obj_type: Data, obj_size: 12 }
         RESPONSE DfuResponse { request: Create { obj_type: Data, obj_size: 12}, result: Success, body: None }
         */
-        let response = target.process(
-            DfuRequest::Create {
-                obj_type: ObjectType::Data,
-                obj_size: 12,
-            },
-            &mut test_flash,
-        );
+        let response = target
+            .process(
+                DfuRequest::Create {
+                    obj_type: ObjectType::Data,
+                    obj_size: 12,
+                },
+                &mut test_flash,
+            )
+            .await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         assert_eq!(response.0.body.is_none(), true);
 
         for i in 0..=3 {
-            let response = target.process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash);
+            let response = target
+                .process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash)
+                .await;
             assert_eq!(target.receipt_count, i + 1);
             assert_eq!(response.0.body.is_none(), true);
         }
 
         // 5th write should trigger the CrC response with body
-        let response = target.process(DfuRequest::Write { data: &[0xbb; 2] }, &mut test_flash);
+        let response = target
+            .process(DfuRequest::Write { data: &[0xbb; 2] }, &mut test_flash)
+            .await;
         if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
             assert_eq!(offset, 10);
             assert_eq!(crc, 0xDB870467);
@@ -1096,7 +1133,9 @@ mod tests {
         assert_eq!(target.receipt_count, 0);
 
         // Final write
-        let response = target.process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash);
+        let response = target
+            .process(DfuRequest::Write { data: &[0xaa; 2] }, &mut test_flash)
+            .await;
         assert_eq!(target.receipt_count, 1);
         assert_eq!(response.0.body.is_none(), true);
 
@@ -1104,7 +1143,7 @@ mod tests {
         REQUEST Crc
         RESPONSE DfuResponse { request: Crc, result: Success, body: Some(Crc { offset: 12, crc: }) }
         */
-        let response = target.process(DfuRequest::Crc {}, &mut test_flash);
+        let response = target.process(DfuRequest::Crc {}, &mut test_flash).await;
         assert_eq!(DfuResult::Success, response.0.result);
         assert_eq!(DfuStatus::InProgress, response.1);
         if let Some(DfuResponseBody::Crc { offset, crc }) = response.0.body {
@@ -1119,13 +1158,19 @@ mod tests {
         REQUEST Execute
         RESPONSE DfuResponse { request: Execute, result: Success, body: None }
         */
-        let response = target.process(DfuRequest::Execute, &mut test_flash);
+        let response = target.process(DfuRequest::Execute, &mut test_flash).await;
         assert_eq!(DfuResult::Success, response.0.result);
-        assert_eq!(DfuStatus::DoneReset { size: 12 }, response.1);
+        assert_eq!(DfuStatus::DoneReset, response.1);
         assert_eq!(
             &test_flash.mem[0..target.objects[target.current].size as usize],
             &[0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xaa, 0xaa]
         );
+        let magic = &[
+            0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50, 0x52, 0x35, 0x80, 0x79,
+            0xb6, 0x2c,
+        ];
+        let sz = target.objects[target.current].size as usize;
+        assert_eq!(&test_flash.mem[sz..sz + magic.len()], magic,);
     }
 
     ///
@@ -1133,7 +1178,7 @@ mod tests {
     ///
     use alloc::vec::Vec;
 
-    use embedded_storage::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
+    use embedded_storage_async::nor_flash::{ErrorType, NorFlash, ReadNorFlash};
 
     extern crate alloc;
 
@@ -1199,7 +1244,7 @@ mod tests {
     {
         const READ_SIZE: usize = 1;
 
-        fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
             self.read(offset, bytes);
             Ok(())
         }
@@ -1215,12 +1260,12 @@ mod tests {
         const WRITE_SIZE: usize = WRITE_SIZE;
         const ERASE_SIZE: usize = ERASE_SIZE;
 
-        fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
             self.write(offset, bytes);
             Ok(())
         }
 
-        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
             self.erase(from, to);
             Ok(())
         }

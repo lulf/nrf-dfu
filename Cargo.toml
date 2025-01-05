@@ -12,8 +12,11 @@ categories = [
 ]
 
 [dependencies]
-embedded-storage = "0.3.1"
+embedded-storage-async = "0.4.1"
 defmt = { version = "0.3", optional = true }
+
+[dev-dependencies]
+futures-test = { version = "0.3" }
 
 [features]
 defmt = [
