@@ -341,6 +341,22 @@ impl<const MTU: usize> DfuTarget<MTU> {
                             self.offset += self.boffset;
                             self.boffset = 0;
                         }
+
+                        info!("Writing magic at end");
+                        // Put the magic at the end of flash if there is space
+                        let magic = AlignedBuffer([
+                            0x77, 0xc2, 0x95, 0xf3, 0x60, 0xd2, 0xef, 0x7f, 0x35, 0x52, 0x50, 0x0f, 0x2c, 0xb6, 0x79, 0x80
+                        ]);
+                        if let Err(e) = dfu.write(dfu.capacity() as u32 - 16, &magic.0[..]).await {
+                            #[cfg(feature = "defmt")]
+                            let e = defmt::Debug2Format(&e);
+                            warn!("Write Error: {:?}", e);
+                            return (
+                                DfuResponse::new(request, DfuResult::OpFailed),
+                                DfuStatus::InProgress,
+                            );
+                        }
+
                         info!("Verifying firmware integrity");
                         let mut check = Crc32::init();
                         let mut buf = [0; MTU];
@@ -365,22 +381,7 @@ impl<const MTU: usize> DfuTarget<MTU> {
                         if obj.crc.finish() == check.finish() {
                             info!("Firmware CRC check success");
 
-                            // Put the magic at the end of flash if there is space
-                            if size < dfu.capacity() as u32 - 16 {
-                                let magic = AlignedBuffer([
-                                    0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50,
-                                    0x52, 0x35, 0x80, 0x79, 0xb6, 0x2c,
-                                ]);
-                                if let Err(e) = dfu.write(dfu.capacity() as u32 - 16, &magic.0[..]).await {
-                                    #[cfg(feature = "defmt")]
-                                    let e = defmt::Debug2Format(&e);
-                                    warn!("Write Error: {:?}", e);
-                                    return (
-                                        DfuResponse::new(request, DfuResult::OpFailed),
-                                        DfuStatus::InProgress,
-                                    );
-                                }
-                            }
+
                             (
                                 DfuResponse::new(request, DfuResult::Success),
                                 DfuStatus::DoneReset,
@@ -1162,8 +1163,22 @@ mod tests {
             &[0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xaa, 0xaa]
         );
         let magic = &[
-            0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50, 0x52, 0x35, 0x80, 0x79,
-            0xb6, 0x2c,
+            0x77,
+            0xC2,
+            0x95,
+            0xF3,
+            0x60,
+            0xD2,
+            0xEF,
+            0x7F,
+            0x35,
+            0x52,
+            0x50,
+            0xF,
+            0x2C,
+            0xB6,
+            0x79,
+            0x80,
         ];
         assert_eq!(&test_flash.mem[test_flash.mem.len() - 16..], magic);
     }
