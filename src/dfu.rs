@@ -281,8 +281,8 @@ impl<const MTU: usize> DfuTarget<MTU> {
                     };
                     self.current = idx;
                     if let ObjectType::Data = obj_type {
-                        let size = self.objects[self.current].size;
-                        let to = size + (DFU::ERASE_SIZE as u32 - size % DFU::ERASE_SIZE as u32);
+                        // Do a full erase to allow magic to be written
+                        let to = dfu.capacity();
                         match dfu.erase(0, to as u32).await {
                             Ok(_) => {
                                 self.objects[self.current].offset = 0;
