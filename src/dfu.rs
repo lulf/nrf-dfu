@@ -365,24 +365,20 @@ impl<const MTU: usize> DfuTarget<MTU> {
                         if obj.crc.finish() == check.finish() {
                             info!("Firmware CRC check success");
 
-                            // Fill the rest with some magic
-                            if size < dfu.capacity() as u32 {
+                            // Put the magic at the end of flash if there is space
+                            if size < dfu.capacity() as u32 - 16 {
                                 let magic = AlignedBuffer([
                                     0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50,
                                     0x52, 0x35, 0x80, 0x79, 0xb6, 0x2c,
                                 ]);
-                                for offset in (size..dfu.capacity() as u32).step_by(magic.0.len()) {
-                                    let to_write =
-                                        (magic.0.len()).min(dfu.capacity() - offset as usize);
-                                    if let Err(e) = dfu.write(offset, &magic.0[..to_write]).await {
-                                        #[cfg(feature = "defmt")]
-                                        let e = defmt::Debug2Format(&e);
-                                        warn!("Write Error: {:?}", e);
-                                        return (
-                                            DfuResponse::new(request, DfuResult::OpFailed),
-                                            DfuStatus::InProgress,
-                                        );
-                                    }
+                                if let Err(e) = dfu.write(dfu.capacity() as u32 - 16, &magic.0[..]).await {
+                                    #[cfg(feature = "defmt")]
+                                    let e = defmt::Debug2Format(&e);
+                                    warn!("Write Error: {:?}", e);
+                                    return (
+                                        DfuResponse::new(request, DfuResult::OpFailed),
+                                        DfuStatus::InProgress,
+                                    );
                                 }
                             }
                             (
@@ -1169,8 +1165,7 @@ mod tests {
             0xf3, 0x95, 0xc2, 0x77, 0x7f, 0xef, 0xd2, 0x60, 0x0f, 0x50, 0x52, 0x35, 0x80, 0x79,
             0xb6, 0x2c,
         ];
-        let sz = target.objects[target.current].size as usize;
-        assert_eq!(&test_flash.mem[sz..sz + magic.len()], magic,);
+        assert_eq!(&test_flash.mem[test_flash.mem.len() - 16..], magic);
     }
 
     ///
